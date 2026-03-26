@@ -185,6 +185,12 @@ class SlackOrganizerApp(rumps.App):
             f"{sleep_check}Prevent Sleep",
             callback=self._toggle_prevent_sleep,
         ))
+        settings.add(rumps.separator)
+        noai_check = "✓ " if cfg.get("no_ai", False) else "   "
+        settings.add(rumps.MenuItem(
+            f"{noai_check}No AI Mode",
+            callback=self._toggle_no_ai,
+        ))
         self.menu.add(settings)
 
         self.menu.add(rumps.separator)
@@ -293,6 +299,11 @@ class SlackOrganizerApp(rumps.App):
             _caffeinate.start()
         else:
             _caffeinate.stop()
+        self._build_menu()
+
+    def _toggle_no_ai(self, _) -> None:
+        cfg["no_ai"] = not cfg.get("no_ai", False)
+        save_config(cfg)
         self._build_menu()
 
     def _mark_all_read(self, _) -> None:

@@ -80,8 +80,17 @@ def _extract_json(text: str) -> any:
 
 class ThreadOrganizer:
     def __init__(self) -> None:
+        # LLM backend — lazily instantiated when first needed.
+        self._llm = None
+        self._llm_backend_name: Optional[str] = None
+
+    def _get_llm(self):
+        """Return the LLM backend, re-instantiating if the configured backend changed."""
         backend_name = cfg.get("llm", {}).get("backend", "copilot")
-        self._llm = BackendFactory.get(backend_name)
+        if self._llm is None or self._llm_backend_name != backend_name:
+            self._llm = BackendFactory.get(backend_name)
+            self._llm_backend_name = backend_name
+        return self._llm
 
     def process(self, notifications: list[SlackNotification]) -> None:
         """Process a batch of new notifications end-to-end."""
@@ -92,6 +101,8 @@ class ThreadOrganizer:
         new = [n for n in notifications if not storage.message_exists(n.notification_id)]
         if not new:
             return
+
+        no_ai: bool = cfg.get("no_ai", False)
 
         # Step 1 — rule-based scoring.
         bundles = [
@@ -107,18 +118,37 @@ class ThreadOrganizer:
             for n in new
         ]
 
-        # Step 2 — LLM thread clustering.
-        bundles = self._cluster_threads(bundles)
-
-        # Step 3 — LLM urgency scoring per thread.
-        thread_scores = self._score_threads(bundles)
+        if no_ai:
+            # No-AI: group by channel slug, skip all LLM calls.
+            bundles = self._cluster_by_channel(bundles)
+            thread_scores: dict[str, float] = {}
+        else:
+            # Step 2 — LLM thread clustering.
+            bundles = self._cluster_threads(bundles)
+            # Step 3 — LLM urgency scoring per thread.
+            thread_scores = self._score_threads(bundles)
 
         # Step 4 — Persist.
-        self._persist(bundles, thread_scores)
+        self._persist(bundles, thread_scores, no_ai=no_ai)
 
     # ------------------------------------------------------------------ #
     #  LLM helpers                                                         #
     # ------------------------------------------------------------------ #
+
+    def _cluster_by_channel(self, bundles: list[MessageBundle]) -> list[MessageBundle]:
+        """
+        No-AI grouping: every message in the same workspace+channel goes into
+        one thread. Uses a deterministic slug — no LLM call made.
+        """
+        for b in bundles:
+            b.thread_id = self._channel_thread_id(b.channel, b.workspace)
+        return bundles
+
+    @staticmethod
+    def _channel_thread_id(channel: str, workspace: str = "") -> str:
+        """Deterministic slug based on workspace+channel only (no sender)."""
+        slug = re.sub(r"[^a-z0-9]+", "-", f"{workspace}-{channel}".lower()).strip("-")
+        return slug[:40] or "general"
 
     def _cluster_threads(self, bundles: list[MessageBundle]) -> list[MessageBundle]:
         """
@@ -187,7 +217,7 @@ class ThreadOrganizer:
         """).strip()
 
         try:
-            raw = self._llm.ask(prompt)
+            raw = self._get_llm().ask(prompt)
             parsed = _extract_json(raw)
             if isinstance(parsed, list):
                 for item in parsed:
@@ -236,7 +266,7 @@ class ThreadOrganizer:
 
         scores: dict[str, float] = {}
         try:
-            raw = self._llm.ask(prompt)
+            raw = self._get_llm().ask(prompt)
             parsed = _extract_json(raw)
             if isinstance(parsed, dict):
                 for tid, score in parsed.items():
@@ -257,6 +287,7 @@ class ThreadOrganizer:
         self,
         bundles: list[MessageBundle],
         thread_scores: dict[str, float],
+        no_ai: bool = False,
     ) -> None:
         # Compute per-thread aggregates.
         thread_bundles: dict[str, list[MessageBundle]] = {}
@@ -264,9 +295,14 @@ class ThreadOrganizer:
             thread_bundles.setdefault(b.thread_id, []).append(b)
 
         for tid, msgs in thread_bundles.items():
-            llm_score = thread_scores.get(tid, 0.0)
-            max_rule = max(m.rule_score for m in msgs)
-            priority = max_rule + (llm_score * _LLM_WEIGHT)
+            if no_ai:
+                priority = 0.0
+                llm_score = 0.0
+                max_rule = 0.0
+            else:
+                llm_score = thread_scores.get(tid, 0.0)
+                max_rule = max(m.rule_score for m in msgs)
+                priority = max_rule + (llm_score * _LLM_WEIGHT)
             latest = max(msgs, key=lambda m: m.timestamp)
 
             storage.upsert_thread(

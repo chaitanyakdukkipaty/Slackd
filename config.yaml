@@ -49,3 +49,7 @@ badge_threshold: 1
 # Keep the Mac awake while Slackd is running (prevents missed notifications).
 # Uses `caffeinate -i` (idle sleep only — battery-friendly, display still sleeps).
 prevent_sleep: true
+
+# Disable LLM calls entirely. Threads are grouped by workspace+channel only.
+# All threads get equal priority (no colour coding).
+no_ai: false
