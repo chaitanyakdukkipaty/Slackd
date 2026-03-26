@@ -24,13 +24,154 @@ Delete all threads
 curl -fsSL https://raw.githubusercontent.com/chaitanyakdukkipaty/Slackd/main/install.sh | bash
 ```
 
-Then start it:
+> The install script clones the repo to `~/.slackd`, creates a virtualenv, installs all deps, and adds `slackd` to `~/.local/bin`.
+
+---
+
+## Post-Install Setup
+
+Complete these steps **once** after installing before running Slackd.
+
+### Step 1 — Grant Accessibility Permission
+
+Slackd reads notification banners via the macOS Accessibility API.
+
+1. Open **System Settings → Privacy & Security → Accessibility**
+2. Click **+** and add your terminal app (Terminal.app, iTerm2, Warp, etc.)
+3. Toggle it **on**
+
+> **If running via `slackd` command:** you may also need to add `/usr/bin/python3` or the `.venv/bin/python3` binary.
+
+### Step 2 — Set Slack to Alert Style
+
+Slackd can only read notifications that stay on screen long enough to inspect.
+
+1. **System Settings → Notifications → Slack**
+2. Set **Alert style** to **Alerts** (the square icon, not the pill-shaped Banner)
+
+### Step 3 — Set Up Your LLM Backend
+
+Choose **one** of the following:
+
+---
+
+#### Option A — GitHub Copilot (default)
+
+Requires a GitHub account with [Copilot](https://github.com/features/copilot) access.
+
+```bash
+# 1. Install GitHub CLI
+brew install gh
+
+# 2. Authenticate (choose browser or token)
+gh auth login
+
+# 3. Install the Copilot CLI extension
+gh extension install github/gh-copilot
+
+# 4. Verify it works
+gh copilot explain "hello"
+```
+
+`config.yaml` default is already `llm.backend: copilot` — no further change needed.
+
+---
+
+#### Option B — Claude (Anthropic API)
+
+```bash
+# 1. Install the Anthropic Python SDK inside the venv
+~/.slackd/.venv/bin/pip install anthropic
+
+# 2. Set your API key (add to ~/.zshrc or ~/.bash_profile to persist)
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+Then open `~/.slackd/src/llm/claude.py` and replace the `NotImplementedError` body with:
+
+```python
+import anthropic
+client = anthropic.Anthropic()
+message = client.messages.create(
+    model="claude-opus-4-5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": prompt}]
+)
+return message.content[0].text
+```
+
+Set the backend in `~/.slackd/config.yaml`:
+
+```yaml
+llm:
+  backend: claude
+```
+
+---
+
+#### Option C — OpenAI API
+
+```bash
+# 1. Install OpenAI SDK inside the venv
+~/.slackd/.venv/bin/pip install openai
+
+# 2. Set your API key
+export OPENAI_API_KEY="sk-..."
+```
+
+Edit `~/.slackd/src/llm/openai_cli.py` to implement `ask()` using `openai.OpenAI().chat.completions.create(...)`, then set:
+
+```yaml
+llm:
+  backend: openai
+```
+
+---
+
+### Step 4 — (Optional) Enable Launch at Login
+
+To have Slackd start automatically after every login:
 
 ```bash
 slackd
 ```
 
-> The install script clones the repo to `~/.slackd`, creates a virtualenv, installs all deps, and adds `slackd` to `~/.local/bin`.
+Then in the menu bar: **⚙ Settings → Launch at Login**
+
+---
+
+## Running Slackd
+
+### Foreground (interactive / debugging)
+
+```bash
+slackd
+```
+
+### Background (detached from terminal)
+
+```bash
+nohup slackd > ~/.slackd/data/slackd.log 2>&1 &
+```
+
+The process will survive closing your terminal. Check the log:
+
+```bash
+tail -f ~/.slackd/data/slackd.log
+```
+
+Stop it:
+
+```bash
+kill $(cat ~/.slackd/data/slack_organizer.pid)
+```
+
+### Via Launch Agent (recommended for daily use)
+
+Enable **Launch at Login** from the Settings submenu in the menu bar. Slackd will automatically start on every login, with logs at:
+
+- `~/.slackd/data/launchagent.stdout.log`
+- `~/.slackd/data/launchagent.stderr.log`
 
 ---
 
@@ -40,27 +181,8 @@ slackd
 |---|---|
 | macOS 13 (Ventura) or later | Uses macOS 15 Notification Center Accessibility API |
 | Python 3.9+ | System Python on macOS works; `brew install python@3.12` recommended |
-| [GitHub CLI](https://cli.github.com/) (`gh`) authenticated | Required for Copilot LLM backend (default) |
+| [GitHub CLI](https://cli.github.com/) (`gh`) + Copilot extension | Required if using Copilot backend (default) |
 | Slack desktop app | Must be installed with Alert-style notifications |
-
----
-
-## Required macOS Permissions
-
-### 1. Accessibility (required)
-
-Slackd reads notification banners from `NotificationCenter.app` via the Accessibility API.
-
-1. **System Settings → Privacy & Security → Accessibility**
-2. Click **+** and add your **Terminal** app (Terminal.app, iTerm2, Warp, etc.)
-3. Enable the toggle
-
-### 2. Slack notification style (required)
-
-Slack must use **Alerts** (persistent banners), not Banners (auto-dismiss):
-
-1. **System Settings → Notifications → Slack**
-2. Set **Alert style** to **Alerts** (the square icon)
 
 ---
 
@@ -75,9 +197,6 @@ cd ~/.slackd
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-
-# Authenticate GitHub CLI (for Copilot LLM backend)
-gh auth login
 
 # Run
 python main.py
@@ -103,17 +222,19 @@ A **🔔** icon appears in your menu bar. Click it to see all tracked threads.
 | **Mark all read** | Clears unread badge |
 | **Delete all threads** | Wipes the local DB |
 | **⚙ Settings → Launch at Login** | Installs/removes `~/Library/LaunchAgents/com.slackorganizer.plist` |
+| **⚙ Settings → Prevent Sleep** | Toggles `caffeinate -i` to keep Mac awake while service runs |
 
 ---
 
 ## Configuration
 
-Edit `~/.slackd/config.yaml` (or `config.yaml` in the project root):
+Edit `~/.slackd/config.yaml`:
 
 | Key | Default | Description |
 |---|---|---|
 | `llm.backend` | `copilot` | LLM backend: `copilot`, `claude`, `openai` |
 | `poll_interval` | `5` | Seconds between periodic polls |
+| `prevent_sleep` | `true` | Run `caffeinate -i` to prevent idle sleep |
 | `urgency_keywords` | (list) | Keywords that boost urgency score |
 | `scoring.dm_bonus` | `3` | Score bonus for direct messages |
 | `scoring.mention_bonus` | `2` | Score bonus for @mentions |
@@ -177,6 +298,7 @@ log stream (usernoted) ──triggers──▶ NotificationCenter.app AX tree
 **LLM calls failing**
 - `gh auth status` — must show authenticated
 - `gh copilot explain "hello"` — test the Copilot CLI works
+- Check `~/.slackd/data/slackd.log` or the launchagent logs for errors
 
 **Two instances running**
 - A PID lock at `data/slack_organizer.pid` prevents this. If stale, delete it: `rm ~/.slackd/data/slack_organizer.pid`
@@ -205,3 +327,5 @@ rm -rf ~/.slackd ~/.local/bin/slackd ~/Library/LaunchAgents/com.slackorganizer.p
 - All data is stored locally in `data/notifications.db` (SQLite)
 - Notification content is sent only to the configured LLM CLI tool (local process)
 - No telemetry, no network calls except LLM
+
+
