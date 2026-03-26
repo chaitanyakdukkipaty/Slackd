@@ -47,12 +47,20 @@ class MessageBundle:
 
 def _extract_json(text: str):
     """Try to pull a JSON object/array out of LLM output that may have prose around it."""
+    # Also handle markdown code fences: ```json ... ``` or ``` ... ```
+    fence = re.search(r"```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        try:
+            return json.loads(fence.group(1))
+        except json.JSONDecodeError:
+            pass
     match = re.search(r"(\[.*\]|\{.*\})", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
+    logger.debug("_extract_json: no JSON found in LLM output: %r", text[:300])
     return None
 
 
@@ -184,7 +192,7 @@ class ThreadOrganizer:
             raw = self._get_llm().ask(prompt)
             parsed = _extract_json(raw)
             if not isinstance(parsed, list):
-                logger.warning("cluster_all: LLM returned non-list, aborting")
+                logger.warning("cluster_all: LLM returned non-list. Raw output: %r", raw[:400])
                 return
         except Exception as exc:
             logger.warning("cluster_all LLM call failed: %s", exc)
@@ -263,7 +271,7 @@ class ThreadOrganizer:
             raw = self._get_llm().ask(prompt)
             parsed = _extract_json(raw)
             if not isinstance(parsed, dict):
-                logger.warning("score_all: LLM returned non-dict, aborting")
+                logger.warning("score_all: LLM returned non-dict. Raw output: %r", raw[:400])
                 return
         except Exception as exc:
             logger.warning("score_all LLM call failed: %s", exc)
