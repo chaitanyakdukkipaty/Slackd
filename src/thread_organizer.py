@@ -56,7 +56,6 @@ def _extract_json(text: str):
     return None
 
 
-@staticmethod
 def _channel_thread_id(channel: str, workspace: str = "") -> str:
     """Deterministic slug based on workspace+channel only (no sender)."""
     slug = re.sub(r"[^a-z0-9]+", "-", f"{workspace}-{channel}".lower()).strip("-")
