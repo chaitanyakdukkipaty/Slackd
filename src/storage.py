@@ -93,6 +93,16 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE threads ADD COLUMN {col} TEXT DEFAULT {default}")
             except Exception:
                 pass
+        # Add is_read to messages if not present.
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN is_read INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        # Add nc_group_desc to messages if not present.
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN nc_group_desc TEXT DEFAULT ''")
+        except Exception:
+            pass
 
 def upsert_message(
     *,
@@ -103,15 +113,16 @@ def upsert_message(
     body: str,
     timestamp: str,
     notification_id: str,
+    nc_group_desc: str = "",
 ) -> None:
     with db() as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO messages
-                (id, thread_id, sender, channel, body, timestamp, notification_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (id, thread_id, sender, channel, body, timestamp, notification_id, nc_group_desc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (msg_id, thread_id, sender, channel, body, timestamp, notification_id),
+            (msg_id, thread_id, sender, channel, body, timestamp, notification_id, nc_group_desc),
         )
 
 
@@ -139,7 +150,7 @@ def upsert_thread(
                 workspace     = excluded.workspace,
                 sender        = excluded.sender,
                 last_body     = excluded.last_body,
-                nc_group_desc = excluded.nc_group_desc,
+                nc_group_desc = CASE WHEN excluded.nc_group_desc != '' THEN excluded.nc_group_desc ELSE nc_group_desc END,
                 priority      = excluded.priority,
                 rule_score    = excluded.rule_score,
                 llm_score     = excluded.llm_score,
@@ -176,13 +187,32 @@ def delete_thread(thread_id: str) -> None:
         conn.execute("DELETE FROM threads WHERE id = ?", (thread_id,))
 
 
+def mark_message_read(msg_id: str) -> None:
+    """Mark a single message as read. If all messages in its thread are now read, clear thread unread."""
+    with db() as conn:
+        conn.execute("UPDATE messages SET is_read = 1 WHERE id = ?", (msg_id,))
+        row = conn.execute(
+            "SELECT thread_id FROM messages WHERE id = ?", (msg_id,)
+        ).fetchone()
+        if row:
+            tid = row[0]
+            unread_count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE thread_id = ? AND is_read = 0",
+                (tid,),
+            ).fetchone()[0]
+            if unread_count == 0:
+                conn.execute("UPDATE threads SET unread = 0 WHERE id = ?", (tid,))
+
+
 def mark_thread_read(thread_id: str) -> None:
     with db() as conn:
+        conn.execute("UPDATE messages SET is_read = 1 WHERE thread_id = ?", (thread_id,))
         conn.execute("UPDATE threads SET unread = 0 WHERE id = ?", (thread_id,))
 
 
 def mark_all_read() -> None:
     with db() as conn:
+        conn.execute("UPDATE messages SET is_read = 1")
         conn.execute("UPDATE threads SET unread = 0")
 
 

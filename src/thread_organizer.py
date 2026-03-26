@@ -43,6 +43,7 @@ class MessageBundle:
     body: str
     timestamp: str
     thread_id: Optional[str] = None
+    nc_group_desc: str = ""
 
 
 def _extract_json(text: str):
@@ -117,6 +118,7 @@ class ThreadOrganizer:
                 body=n.body,
                 timestamp=n.timestamp,
                 thread_id=_channel_thread_id(n.channel, n.workspace),
+                nc_group_desc=n.nc_group_desc,
             )
             for n in new
         ]
@@ -304,7 +306,7 @@ class ThreadOrganizer:
                 workspace=latest.workspace,
                 sender=latest.sender,
                 last_body=latest.body[:200],
-                nc_group_desc="",
+                nc_group_desc=latest.nc_group_desc,
                 priority=0.0,
                 rule_score=0.0,
                 llm_score=0.0,
@@ -318,5 +320,6 @@ class ThreadOrganizer:
                     body=m.body,
                     timestamp=m.timestamp,
                     notification_id=m.notification_id,
+                    nc_group_desc=m.nc_group_desc,
                 )
 

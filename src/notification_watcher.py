@@ -166,6 +166,42 @@ def click_nc_notification(nc_group_desc: str) -> bool:
     return False
 
 
+def find_and_click_nc_for_channel(workspace: str, channel: str) -> bool:
+    """
+    Live-scan NC for any still-visible Slack notification matching the given
+    workspace + channel.  Used as a second-tier fallback when the stored
+    nc_group_desc is stale (notification was already dismissed / replaced).
+    Returns True if a matching notification was found and clicked.
+    """
+    nc_pid = _find_nc_pid()
+    if nc_pid is None:
+        return False
+
+    # Normalise for comparison: strip leading '#' and lowercase.
+    bare_channel   = channel.lstrip("#").lower()
+    bare_workspace = workspace.lower()
+
+    ax      = AXUIElementCreateApplication(nc_pid)
+    windows = _ax(ax, kAXWindowsAttribute) or []
+    for window in windows:
+        title = _ax(window, kAXTitleAttribute) or ""
+        if title and "Notification Center" not in title:
+            continue
+        groups: list[dict] = []
+        _walk_nc_window(window, groups, collect_elements=True)
+        for g in groups:
+            gws  = g.get("workspace", "").lower()
+            gch  = g.get("channel",   "").lstrip("#").lower()
+            if gch == bare_channel and (not bare_workspace or gws == bare_workspace):
+                elem = g.get("_element")
+                if elem is not None:
+                    err = AXUIElementPerformAction(elem, kAXPressAction)
+                    if err == 0:
+                        logger.info("Clicked NC channel notification: %s / %s", workspace, channel)
+                        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Sender / body parsing
 # ---------------------------------------------------------------------------

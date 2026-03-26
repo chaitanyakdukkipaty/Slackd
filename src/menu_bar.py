@@ -20,7 +20,7 @@ Thread list with accordion-style submenus:
 import logging
 import subprocess
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -29,7 +29,7 @@ import rumps
 from src.config import cfg, save_config
 from src import storage, launch_agent
 import src.caffeinate as _caffeinate
-from src.notification_watcher import click_nc_notification
+from src.notification_watcher import click_nc_notification, find_and_click_nc_for_channel
 
 if TYPE_CHECKING:
     from src.thread_organizer import ThreadOrganizer
@@ -84,23 +84,56 @@ def _bare_channel_name(channel: str) -> str:
     return name
 
 
-def _open_in_slack_fallback(channel: str, workspace: str, body: str = "") -> None:
+def _slack_date_range(timestamp: str):
+    """
+    Parse an ISO-8601 timestamp and return (after_date, before_date) strings
+    for a ±10-minute Slack search window (YYYY-MM-DD format).
+    Returns (None, None) if timestamp is unparseable.
+    """
+    try:
+        ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except Exception:
+        return None, None
+    start = ts - timedelta(minutes=10)
+    end   = ts + timedelta(minutes=10)
+    # Return date strings; if the window crosses midnight include both dates
+    after  = start.strftime("%Y-%m-%d")
+    before = end.strftime("%Y-%m-%d")
+    return after, before
+
+
+def _open_in_slack_fallback(channel: str, workspace: str, body: str = "",
+                             timestamp: str = "") -> None:
     """
     Fallback: open Slack, jump to channel via Quick Switcher (⌘K),
-    then search for the message body with ⌘F so Slack highlights it.
-    User can then click the message to open the thread panel.
+    then search with ⌘F. When a timestamp is provided, a ±10-minute date
+    range (after:/before:) is prepended to the query for tighter filtering.
     """
     bare = _bare_channel_name(channel).replace("'", "\\'")
     if not bare:
         subprocess.run(["open", "-a", "Slack"], check=False)
         return
 
-    # Trim body for search — use first ~50 chars, no quotes/special chars
+    # Trim body for search — first ~50 chars, no quotes/backslashes
     search_text = ""
     if body:
         search_text = body[:50].replace("'", "").replace('"', "").replace("\\", "").strip()
 
-    if search_text:
+    # Build the search query, optionally with a ±10-min date range.
+    if timestamp:
+        after, before = _slack_date_range(timestamp)
+        if after and before and after != before:
+            date_filter = f"after:{after} before:{before} "
+        elif after:
+            date_filter = f"after:{after} "
+        else:
+            date_filter = ""
+    else:
+        date_filter = ""
+
+    full_query = f"{date_filter}{search_text}".strip()
+
+    if full_query:
         script = f"""
             tell application "Slack" to activate
             delay 0.6
@@ -112,9 +145,11 @@ def _open_in_slack_fallback(channel: str, workspace: str, body: str = "") -> Non
                     delay 0.5
                     key code 36
                     delay 1.0
+                    key code 53
+                    delay 0.3
                     keystroke "f" using command down
                     delay 0.5
-                    keystroke "{search_text}"
+                    keystroke "{full_query}"
                     delay 0.5
                     key code 36
                 end tell
@@ -142,14 +177,19 @@ def _open_in_slack_fallback(channel: str, workspace: str, body: str = "") -> Non
 
 
 def _navigate_to_message(nc_group_desc: str, channel: str, workspace: str,
-                         body: str = "") -> None:
+                         body: str = "", timestamp: str = "") -> None:
     """
-    Primary: click the NC notification (opens exact message/thread in Slack).
-    Fallback: Quick Switcher to channel + ⌘F search for the message body.
+    3-tier fallback to open the right message in Slack:
+      1. Exact NC click using stored nc_group_desc (opens the exact thread).
+      2. Live channel scan — if the exact desc is stale, find any still-visible
+         notification for this workspace+channel and click it.
+      3. AppleScript ⌘K → channel → ⌘F search with optional ±10-min date filter.
     """
     if nc_group_desc and click_nc_notification(nc_group_desc):
-        return  # exact message/thread opened via NC click ✓
-    _open_in_slack_fallback(channel, workspace, body)
+        return
+    if channel and find_and_click_nc_for_channel(workspace, channel):
+        return
+    _open_in_slack_fallback(channel, workspace, body, timestamp)
 
 
 # ---------------------------------------------------------------------------
@@ -264,29 +304,35 @@ class SlackOrganizerApp(rumps.App):
         item = rumps.MenuItem(label)
 
         # ── 🔗 Open in Slack (exact message / thread) ──
+        # Thread-level open: the label hints whether exact NC click is likely.
+        # nc_desc here is the thread's stored desc (latest message's desc).
         open_label = "🔗  Open in Slack — exact thread" if nc_desc else "🔗  Open in Slack — search in channel"
         item.add(rumps.MenuItem(
             open_label,
-            callback=self._make_open_callback(tid, nc_desc, channel, workspace, preview),
+            callback=self._make_open_callback(
+                tid, nc_desc, channel, workspace, preview,
+                timestamp=thread["updated_at"] or "",
+            ),
         ))
 
         # ── Message history (accordion) — newest first ──
         messages = storage.get_messages_for_thread(tid)
         if messages:
             item.add(rumps.separator)
-            for i, msg in enumerate(messages):
+            for msg in messages:
                 time_str = _fmt_time(msg["timestamp"])
                 msender  = (msg["sender"] or "")[:18]
                 mbody    = (msg["body"]   or "")[:60]
                 sender_label = f"{msender}: " if msender else ""
                 msg_label = f"  {time_str}  {sender_label}{mbody}"
-                # The latest message (i==0, since DESC order) can use the stored nc_desc
-                # to AXPress the exact notification. Older messages fall back to ⌘F search.
-                msg_nc_desc = nc_desc if i == 0 else ""
+                # Each message stores its own nc_group_desc — use it for exact NC click.
+                msg_nc_desc = (msg["nc_group_desc"] or "") if "nc_group_desc" in msg.keys() else ""
                 item.add(rumps.MenuItem(
                     msg_label,
                     callback=self._make_open_callback(
                         tid, msg_nc_desc, channel, workspace, msg["body"] or "",
+                        timestamp=msg["timestamp"] or "",
+                        msg_id=msg["id"],
                     ),
                 ))
 
@@ -304,10 +350,14 @@ class SlackOrganizerApp(rumps.App):
     # ------------------------------------------------------------------ #
 
     def _make_open_callback(self, thread_id: str, nc_group_desc: str,
-                             channel: str, workspace: str, body: str = ""):
+                             channel: str, workspace: str, body: str = "",
+                             timestamp: str = "", msg_id: Optional[str] = None):
         def callback(_):
-            storage.mark_thread_read(thread_id)
-            _navigate_to_message(nc_group_desc, channel, workspace, body)
+            if msg_id:
+                storage.mark_message_read(msg_id)
+            else:
+                storage.mark_thread_read(thread_id)
+            _navigate_to_message(nc_group_desc, channel, workspace, body, timestamp)
             self._build_menu()
         return callback
 
