@@ -121,36 +121,68 @@ class ThreadOrganizer:
     # ------------------------------------------------------------------ #
 
     def _cluster_threads(self, bundles: list[MessageBundle]) -> list[MessageBundle]:
-        """Ask the LLM to group messages into thread buckets."""
-        if len(bundles) == 1:
-            b = bundles[0]
-            b.thread_id = b.thread_id or self._stable_thread_id(b.channel, b.sender, b.workspace)
-            return bundles
+        """
+        Ask the LLM to group incoming messages into threads.
+
+        Also passes existing thread context so new messages can be merged
+        into threads already in the DB rather than always creating new ones.
+        """
+        # Load recent existing threads as context (cap at 30 to stay within token budget).
+        existing_threads = storage.get_threads_by_priority(limit=30)
+        existing_context = "\n".join(
+            f"  EXISTING id={t['id']!r} channel={t['channel']!r} "
+            f"workspace={t['workspace']!r} last_msg={t['last_body'][:80]!r}"
+            for t in existing_threads
+        )
+
+        def _flags(b: MessageBundle) -> str:
+            flags = []
+            if b.channel.lower().startswith(("dm", "direct")):
+                flags.append("DM")
+            if "@" in b.body:
+                flags.append("@mention")
+            if b.sender.lower().endswith(("bot", "(bot)")):
+                flags.append("bot")
+            if not b.sender:
+                flags.append("automated")
+            return ",".join(flags) or "normal"
 
         messages_text = "\n".join(
-            f"{i}: sender={b.sender!r} workspace={b.workspace!r} channel={b.channel!r} body={b.body!r}"
+            f"{i}: channel={b.channel!r} workspace={b.workspace!r} "
+            f"sender={b.sender!r} flags={_flags(b)} "
+            f"body={b.body[:120]!r}"
             for i, b in enumerate(bundles)
         )
-        prompt = textwrap.dedent(f"""
-            You are a Slack message organiser.
-            Below are {len(bundles)} new Slack notifications (indexed 0-based).
-            Group them into conversation threads — messages that are likely replies or
-            continuations of the same conversation should share a thread_id.
 
-            Respond ONLY with a JSON array like:
+        existing_section = (
+            f"\nExisting threads already in the system (you may reuse their id):\n{existing_context}\n"
+            if existing_context else ""
+        )
+
+        prompt = textwrap.dedent(f"""
+            You are a Slack thread organiser. Your job is to assign each new message
+            to a conversation thread — either an EXISTING thread or a NEW one.
+
+            RULES:
+            1. If a new message clearly continues an existing thread (same channel,
+               same topic, or a direct reply), assign it the EXISTING thread id.
+            2. If multiple new messages belong together, give them the SAME new thread_id.
+            3. Messages in DIFFERENT channels are NEVER in the same thread.
+            4. Automated/bot messages (flags: automated, bot) should each get their
+               own thread unless they are clearly the same alert repeating.
+            5. Calendar reminders are always standalone threads.
+            6. thread_id must be a lowercase hyphenated slug, max 40 chars.
+               Make new slugs descriptive, e.g. "preprod-deploy-failure".
+            7. Respond ONLY with a JSON array — no explanation.
+
+            Output format:
             [
-              {{"index": 0, "thread_id": "a-short-descriptive-slug"}},
-              {{"index": 1, "thread_id": "a-short-descriptive-slug"}},
+              {{"index": 0, "thread_id": "existing-or-new-slug"}},
+              {{"index": 1, "thread_id": "existing-or-new-slug"}},
               ...
             ]
-
-            Rules:
-            - Use the same thread_id string for messages in the same conversation.
-            - thread_id must be a slug (lowercase, hyphens, no spaces), max 40 chars.
-            - If a message stands alone, give it a unique thread_id.
-            - Do not include any explanation.
-
-            Messages:
+            {existing_section}
+            New messages to classify:
             {messages_text}
         """).strip()
 
@@ -166,7 +198,7 @@ class ThreadOrganizer:
         except Exception as exc:
             logger.warning("Thread clustering LLM call failed: %s", exc)
 
-        # Fall back: any unassigned bundle gets its own thread.
+        # Fallback: any unassigned bundle gets a deterministic slug.
         for b in bundles:
             if not b.thread_id:
                 b.thread_id = self._stable_thread_id(b.channel, b.sender, b.workspace)
