@@ -103,6 +103,24 @@ def _parse_nc_group_desc(desc: str) -> Optional[dict]:
     return {"workspace": workspace, "channel": channel, "body": body}
 
 
+def _open_nc_panel() -> None:
+    """
+    Open the macOS Notification Center panel so its notifications become
+    visible in the AX tree.  Uses the Control+F3 → Tab approach or the
+    clock-click equivalent via AppleScript.
+    Falls back silently if it fails.
+    """
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to key code 100 using {control down}'],
+            check=False, timeout=3,
+        )
+        time.sleep(0.4)
+    except Exception:
+        pass
+
+
 def _walk_nc_window(el, results: list, depth: int = 0, collect_elements: bool = False):
     """Recursively find Slack AXGroup elements in a NotificationCenter window."""
     if depth > 12:
@@ -123,15 +141,36 @@ def _walk_nc_window(el, results: list, depth: int = 0, collect_elements: bool = 
         _walk_nc_window(child, results, depth + 1, collect_elements)
 
 
+def dump_nc_tree() -> None:
+    """
+    Debug helper: log every NC window title and all AXGroup descriptions found.
+    Run from a REPL or temporarily call from click_nc_notification to diagnose
+    structure mismatches across macOS versions.
+    """
+    nc_pid = _find_nc_pid()
+    if nc_pid is None:
+        logger.warning("dump_nc_tree: NotificationCenter process not found")
+        return
+    ax = AXUIElementCreateApplication(nc_pid)
+    windows = _ax(ax, kAXWindowsAttribute) or []
+    logger.info("dump_nc_tree: %d NC window(s)", len(windows))
+    for i, window in enumerate(windows):
+        title = _ax(window, kAXTitleAttribute) or "<no title>"
+        groups: list[dict] = []
+        _walk_nc_window(window, groups)
+        logger.info("  window[%d] title=%r  slack_groups=%d", i, title, len(groups))
+        for g in groups:
+            logger.info("    group_desc=%r", g.get("group_desc", "")[:80])
+
+
 def _read_nc_slack_notifications(nc_pid: int) -> list[dict]:
     """Walk the NotificationCenter AX tree and return Slack notification dicts."""
     ax      = AXUIElementCreateApplication(nc_pid)
     windows = _ax(ax, kAXWindowsAttribute) or []
     results = []
     for window in windows:
-        title = _ax(window, kAXTitleAttribute) or ""
-        if title and "Notification Center" not in title:
-            continue
+        # Process ALL NC windows — filtering by title is too strict on macOS Sequoia
+        # where banner and panel windows use different (or empty) titles.
         _walk_nc_window(window, results)
     return results
 
@@ -139,19 +178,18 @@ def _read_nc_slack_notifications(nc_pid: int) -> list[dict]:
 def click_nc_notification(nc_group_desc: str) -> bool:
     """
     Find the NC AXGroup matching nc_group_desc and AXPress it.
-    This is identical to the user clicking the notification — Slack opens the exact message.
+    Opens the NC panel first so notifications are always in the AX tree.
     Returns True if clicked, False if the notification is no longer in NC.
     """
     nc_pid = _find_nc_pid()
     if nc_pid is None:
         return False
 
+    _open_nc_panel()
+
     ax      = AXUIElementCreateApplication(nc_pid)
     windows = _ax(ax, kAXWindowsAttribute) or []
     for window in windows:
-        title = _ax(window, kAXTitleAttribute) or ""
-        if title and "Notification Center" not in title:
-            continue
         groups: list[dict] = []
         _walk_nc_window(window, groups, collect_elements=True)
         for g in groups:
@@ -169,13 +207,15 @@ def click_nc_notification(nc_group_desc: str) -> bool:
 def find_and_click_nc_for_channel(workspace: str, channel: str) -> bool:
     """
     Live-scan NC for any still-visible Slack notification matching the given
-    workspace + channel.  Used as a second-tier fallback when the stored
-    nc_group_desc is stale (notification was already dismissed / replaced).
+    workspace + channel.  Opens the NC panel first so all notifications are
+    visible in the AX tree regardless of whether the panel was already open.
     Returns True if a matching notification was found and clicked.
     """
     nc_pid = _find_nc_pid()
     if nc_pid is None:
         return False
+
+    _open_nc_panel()
 
     # Normalise for comparison: strip leading '#' and lowercase.
     bare_channel   = channel.lstrip("#").lower()
@@ -184,9 +224,6 @@ def find_and_click_nc_for_channel(workspace: str, channel: str) -> bool:
     ax      = AXUIElementCreateApplication(nc_pid)
     windows = _ax(ax, kAXWindowsAttribute) or []
     for window in windows:
-        title = _ax(window, kAXTitleAttribute) or ""
-        if title and "Notification Center" not in title:
-            continue
         groups: list[dict] = []
         _walk_nc_window(window, groups, collect_elements=True)
         for g in groups:
