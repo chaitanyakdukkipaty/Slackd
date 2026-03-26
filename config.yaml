@@ -45,3 +45,7 @@ max_threads_displayed: 20
 
 # Number of unread threads to accumulate before showing badge on icon
 badge_threshold: 1
+
+# Keep the Mac awake while Slackd is running (prevents missed notifications).
+# Uses `caffeinate -i` (idle sleep only — battery-friendly, display still sleeps).
+prevent_sleep: true

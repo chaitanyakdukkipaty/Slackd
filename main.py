@@ -16,6 +16,7 @@ from pathlib import Path
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from src import storage
+from src.caffeinate import start as caffeinate_start, stop as caffeinate_stop
 from src.config import cfg
 from src.notification_watcher import NotificationWatcher
 from src.thread_organizer import ThreadOrganizer
@@ -75,6 +76,10 @@ def main() -> None:
     # Initialise the local database.
     storage.init_db()
 
+    # Keep Mac awake so notifications are never missed.
+    if cfg.get("prevent_sleep", True):
+        caffeinate_start()
+
     organizer = ThreadOrganizer()
     watcher = NotificationWatcher()
 
@@ -98,6 +103,7 @@ def main() -> None:
 
     def _shutdown(sig, frame):
         logger.info("Shutting down…")
+        caffeinate_stop()
         watcher.stop()
         scheduler.shutdown(wait=False)
         _release_pid_lock()
@@ -111,6 +117,7 @@ def main() -> None:
     try:
         app.run()
     finally:
+        caffeinate_stop()
         _release_pid_lock()
 
 

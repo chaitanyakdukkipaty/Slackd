@@ -23,8 +23,9 @@ from datetime import datetime, timezone
 
 import rumps
 
-from src.config import cfg
+from src.config import cfg, save_config
 from src import storage, launch_agent
+import src.caffeinate as _caffeinate
 from src.notification_watcher import click_nc_notification
 
 logger = logging.getLogger(__name__)
@@ -179,6 +180,11 @@ class SlackOrganizerApp(rumps.App):
             f"{login_check}Launch at Login",
             callback=self._toggle_launch_at_login,
         ))
+        sleep_check = "✓ " if cfg.get("prevent_sleep", True) else "   "
+        settings.add(rumps.MenuItem(
+            f"{sleep_check}Prevent Sleep",
+            callback=self._toggle_prevent_sleep,
+        ))
         self.menu.add(settings)
 
         self.menu.add(rumps.separator)
@@ -277,6 +283,16 @@ class SlackOrganizerApp(rumps.App):
             launch_agent.disable()
         else:
             launch_agent.enable()
+        self._build_menu()
+
+    def _toggle_prevent_sleep(self, _) -> None:
+        current = cfg.get("prevent_sleep", True)
+        cfg["prevent_sleep"] = not current
+        save_config(cfg)
+        if cfg["prevent_sleep"]:
+            _caffeinate.start()
+        else:
+            _caffeinate.stop()
         self._build_menu()
 
     def _mark_all_read(self, _) -> None:
