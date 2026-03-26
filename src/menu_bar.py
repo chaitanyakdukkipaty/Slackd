@@ -19,7 +19,9 @@ Thread list with accordion-style submenus:
 """
 import logging
 import subprocess
+import threading
 from datetime import datetime, timezone
+from typing import Optional, TYPE_CHECKING
 
 import rumps
 
@@ -27,6 +29,9 @@ from src.config import cfg, save_config
 from src import storage, launch_agent
 import src.caffeinate as _caffeinate
 from src.notification_watcher import click_nc_notification
+
+if TYPE_CHECKING:
+    from src.thread_organizer import ThreadOrganizer
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,15 @@ _T_ORANGE      = _THRESHOLDS.get("orange", 5)
 _T_YELLOW      = _THRESHOLDS.get("yellow", 2)
 _MAX_THREADS   = cfg.get("max_threads_displayed", 20)
 _BADGE_THRESHOLD = cfg.get("badge_threshold", 1)
+
+# Interval options shown in the Settings submenus.
+_INTERVAL_OPTIONS = [
+    ("Off",                  0),
+    ("On notification",     -1),
+    ("Every 15 min",        15),
+    ("Every 30 min",        30),
+    ("Every 1 hr",          60),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +153,11 @@ def _navigate_to_message(nc_group_desc: str, channel: str, workspace: str,
 # ---------------------------------------------------------------------------
 
 class SlackOrganizerApp(rumps.App):
-    def __init__(self) -> None:
+    def __init__(self, organizer=None, scheduler=None) -> None:
         super().__init__(name="SlackOrganizer", title="🔔", quit_button=None)
+        self._organizer = organizer
+        self._scheduler = scheduler
+        self._llm_running = False  # guards concurrent LLM button presses
         self._build_menu()
 
     # ------------------------------------------------------------------ #
@@ -160,6 +177,10 @@ class SlackOrganizerApp(rumps.App):
         else:
             for thread in threads:
                 self.menu.add(self._build_thread_item(thread))
+
+        self.menu.add(rumps.separator)
+        self.menu.add(rumps.MenuItem("Cluster Threads", callback=self._run_cluster))
+        self.menu.add(rumps.MenuItem("Score Priority",  callback=self._run_score))
 
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Mark all read", callback=self._mark_all_read))
@@ -186,15 +207,28 @@ class SlackOrganizerApp(rumps.App):
             callback=self._toggle_prevent_sleep,
         ))
         settings.add(rumps.separator)
-        noai_check = "✓ " if cfg.get("no_ai", False) else "   "
-        settings.add(rumps.MenuItem(
-            f"{noai_check}No AI Mode",
-            callback=self._toggle_no_ai,
-        ))
+        settings.add(self._build_interval_submenu("Auto-cluster", "cluster_interval"))
+        settings.add(self._build_interval_submenu("Auto-score",   "score_interval"))
         self.menu.add(settings)
 
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("✗  Quit", callback=rumps.quit_application))
+
+    def _build_interval_submenu(self, label: str, config_key: str) -> rumps.MenuItem:
+        """Build a submenu for selecting an auto-run interval."""
+        current_val = cfg.get(config_key, 0)
+        current_label = next(
+            (lbl for lbl, val in _INTERVAL_OPTIONS if val == current_val),
+            str(current_val),
+        )
+        parent = rumps.MenuItem(f"{label}: {current_label}")
+        for opt_label, opt_val in _INTERVAL_OPTIONS:
+            check = "✓ " if opt_val == current_val else "   "
+            parent.add(rumps.MenuItem(
+                f"{check}{opt_label}",
+                callback=self._make_interval_callback(config_key, opt_val),
+            ))
+        return parent
 
     def _build_thread_item(self, thread) -> rumps.MenuItem:
         """
@@ -274,6 +308,7 @@ class SlackOrganizerApp(rumps.App):
     def _make_backend_callback(self, name: str):
         def callback(_):
             cfg["llm"]["backend"] = name
+            save_config(cfg)
             logger.info("LLM backend switched to: %s", name)
             self._build_menu()
         return callback
@@ -283,6 +318,65 @@ class SlackOrganizerApp(rumps.App):
             storage.delete_thread(thread_id)
             self._build_menu()
         return callback
+
+    def _make_interval_callback(self, config_key: str, value: int):
+        def callback(_):
+            cfg[config_key] = value
+            save_config(cfg)
+            self._rewire_scheduler(config_key, value)
+            self._build_menu()
+        return callback
+
+    def _rewire_scheduler(self, config_key: str, value: int) -> None:
+        """
+        Update APScheduler job for cluster or score after interval change.
+        Also re-registers post-process hooks for on-notification mode.
+        """
+        if self._scheduler is None or self._organizer is None:
+            return
+
+        if config_key == "cluster_interval":
+            job_id = "cluster_job"
+            fn = self._organizer.cluster_all
+            hook_name = "cluster-on-notif"
+        else:
+            job_id = "score_job"
+            fn = self._organizer.score_all
+            hook_name = "score-on-notif"
+
+        # Remove existing scheduled job if any.
+        try:
+            self._scheduler.remove_job(job_id)
+        except Exception:
+            pass
+
+        # Remove on-notification hooks for this operation and re-add if needed.
+        self._organizer._post_process_hooks = [
+            h for h in self._organizer._post_process_hooks
+            if getattr(h, "_hook_name", None) != hook_name
+        ]
+
+        if value == -1:
+            def _hook(fn=fn, hook_name=hook_name):
+                t = threading.Thread(target=fn, name=hook_name, daemon=True)
+                t.start()
+            _hook._hook_name = hook_name
+            self._organizer.add_post_process_hook(_hook)
+            logger.info("%s set to: on notification", config_key)
+        elif value > 0:
+            def _job(fn=fn):
+                t = threading.Thread(target=fn, name=job_id, daemon=True)
+                t.start()
+            self._scheduler.add_job(
+                _job,
+                trigger="interval",
+                minutes=value,
+                id=job_id,
+                max_instances=1,
+            )
+            logger.info("%s set to: every %d min", config_key, value)
+        else:
+            logger.info("%s set to: manual only", config_key)
 
     def _toggle_launch_at_login(self, _) -> None:
         if launch_agent.is_enabled():
@@ -301,10 +395,35 @@ class SlackOrganizerApp(rumps.App):
             _caffeinate.stop()
         self._build_menu()
 
-    def _toggle_no_ai(self, _) -> None:
-        cfg["no_ai"] = not cfg.get("no_ai", False)
-        save_config(cfg)
-        self._build_menu()
+    def _run_cluster(self, _) -> None:
+        if self._organizer is None or self._llm_running:
+            return
+        self._llm_running = True
+        self.title = "🔔 (clustering...)"
+
+        def _task():
+            try:
+                self._organizer.cluster_all()
+            finally:
+                self._llm_running = False
+                self._build_menu()
+
+        threading.Thread(target=_task, name="cluster-manual", daemon=True).start()
+
+    def _run_score(self, _) -> None:
+        if self._organizer is None or self._llm_running:
+            return
+        self._llm_running = True
+        self.title = "🔔 (scoring...)"
+
+        def _task():
+            try:
+                self._organizer.score_all()
+            finally:
+                self._llm_running = False
+                self._build_menu()
+
+        threading.Thread(target=_task, name="score-manual", daemon=True).start()
 
     def _mark_all_read(self, _) -> None:
         storage.mark_all_read()

@@ -6,11 +6,18 @@ The watcher uses two complementary mechanisms:
   1. `log stream` subprocess (real-time trigger via NotificationWatcher.start_log_stream)
   2. APScheduler periodic poll (catches any missed notifications)
 The rumps menu bar app runs on the main thread (required by macOS AppKit).
+
+LLM operations (cluster_all / score_all) run in background threads and are
+triggered by:
+  - Manual button press in the menu bar
+  - APScheduler timed jobs (if cluster_interval / score_interval > 0 in config)
+  - Every new notification batch (if interval == -1 in config)
 """
 import logging
 import os
 import signal
 import sys
+import threading
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -40,7 +47,6 @@ def _acquire_pid_lock() -> bool:
     if _PID_FILE.exists():
         try:
             existing_pid = int(_PID_FILE.read_text().strip())
-            # Check if that process is actually alive.
             os.kill(existing_pid, 0)
             logger.warning(
                 "Another instance is already running (PID %d). Exiting.", existing_pid
@@ -69,25 +75,37 @@ def _poll_job(watcher: NotificationWatcher, organizer: ThreadOrganizer) -> None:
         logger.exception("Error in poll job")
 
 
+def _run_in_thread(fn, name: str) -> None:
+    """Run fn() in a daemon thread (used for LLM jobs from the scheduler)."""
+    t = threading.Thread(target=fn, name=name, daemon=True)
+    t.start()
+
+
 def main() -> None:
     if not _acquire_pid_lock():
         sys.exit(0)
 
-    # Initialise the local database.
     storage.init_db()
 
-    # Keep Mac awake so notifications are never missed.
     if cfg.get("prevent_sleep", True):
         caffeinate_start()
 
     organizer = ThreadOrganizer()
-    watcher = NotificationWatcher()
 
-    # Real-time: log stream triggers immediate Accessibility read + organizer.
+    # Wire on-notification LLM hooks if interval == -1.
+    if cfg.get("cluster_interval", 0) == -1:
+        organizer.add_post_process_hook(
+            lambda: _run_in_thread(organizer.cluster_all, "cluster-on-notif")
+        )
+    if cfg.get("score_interval", 0) == -1:
+        organizer.add_post_process_hook(
+            lambda: _run_in_thread(organizer.score_all, "score-on-notif")
+        )
+
+    watcher = NotificationWatcher()
     watcher.register_callback(organizer.process)
     watcher.start_log_stream()
 
-    # Periodic safety net: catches any notifications missed by log stream.
     poll_interval = cfg.get("poll_interval", 5)
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(
@@ -98,6 +116,30 @@ def main() -> None:
         id="notification_poll",
         max_instances=1,
     )
+
+    # Timed LLM jobs (interval > 0 means N minutes).
+    cluster_mins = cfg.get("cluster_interval", 0)
+    if cluster_mins > 0:
+        scheduler.add_job(
+            lambda: _run_in_thread(organizer.cluster_all, "cluster-scheduled"),
+            trigger="interval",
+            minutes=cluster_mins,
+            id="cluster_job",
+            max_instances=1,
+        )
+        logger.info("Auto-cluster every %d min", cluster_mins)
+
+    score_mins = cfg.get("score_interval", 0)
+    if score_mins > 0:
+        scheduler.add_job(
+            lambda: _run_in_thread(organizer.score_all, "score-scheduled"),
+            trigger="interval",
+            minutes=score_mins,
+            id="score_job",
+            max_instances=1,
+        )
+        logger.info("Auto-score every %d min", score_mins)
+
     scheduler.start()
     logger.info("Notification watcher started (log stream + %ds poll)", poll_interval)
 
@@ -113,7 +155,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
 
     # rumps.App.run() must be called from the main thread.
-    app = SlackOrganizerApp()
+    app = SlackOrganizerApp(organizer=organizer, scheduler=scheduler)
     try:
         app.run()
     finally:

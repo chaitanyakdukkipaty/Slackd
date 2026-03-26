@@ -210,19 +210,23 @@ A **🔔** icon appears in your menu bar. Click it to see all tracked threads.
 
 | Element | Meaning |
 |---|---|
-| **● 🔴** | Unread, high urgency |
+| **● 🔴** | Unread, high urgency (set by Score Priority) |
 | **● 🟠** | Unread, medium urgency |
 | **● 🟡** | Unread, low urgency |
-| **○ ⚪** | Read |
+| **○ ⚪** | Read or not yet scored |
 | Click thread | Opens accordion with all messages |
 | **🔗 Open in Slack — exact thread** | AX-clicks the notification → Slack opens that exact message/thread |
 | **🔗 Open in Slack — search in channel** | Navigates to channel + searches for message body (⌘F) |
 | Click a message row | Searches for that specific message in Slack |
 | **🗑 Delete thread** | Removes thread + all its messages |
+| **Cluster Threads** | LLM re-groups all messages into descriptive conversation threads |
+| **Score Priority** | LLM scores all threads 0–10; urgency colours update |
 | **Mark all read** | Clears unread badge |
 | **Delete all threads** | Wipes the local DB |
 | **⚙ Settings → Launch at Login** | Installs/removes `~/Library/LaunchAgents/com.slackorganizer.plist` |
 | **⚙ Settings → Prevent Sleep** | Toggles `caffeinate -i` to keep Mac awake while service runs |
+| **⚙ Settings → Auto-cluster** | Off / On notification / Every 15–60 min |
+| **⚙ Settings → Auto-score** | Off / On notification / Every 15–60 min |
 
 ---
 
@@ -233,13 +237,11 @@ Edit `~/.slackd/config.yaml`:
 | Key | Default | Description |
 |---|---|---|
 | `llm.backend` | `copilot` | LLM backend: `copilot`, `claude`, `openai` |
-| `poll_interval` | `5` | Seconds between periodic polls |
+| `llm.score_weight` | `1.0` | Multiplier applied to LLM urgency score (0–10) |
+| `poll_interval` | `5` | Seconds between periodic notification polls |
 | `prevent_sleep` | `true` | Run `caffeinate -i` to prevent idle sleep |
-| `urgency_keywords` | (list) | Keywords that boost urgency score |
-| `scoring.dm_bonus` | `3` | Score bonus for direct messages |
-| `scoring.mention_bonus` | `2` | Score bonus for @mentions |
-| `scoring.keyword_bonus` | `2` | Score bonus per matched keyword |
-| `scoring.llm_weight` | `1.0` | Multiplier applied to LLM urgency score |
+| `cluster_interval` | `0` | When to auto-cluster: `0`=manual, `-1`=on every notification, `N`=every N minutes |
+| `score_interval` | `0` | When to auto-score: `0`=manual, `-1`=on every notification, `N`=every N minutes |
 | `priority_thresholds.red` | `8` | Minimum score for 🔴 |
 | `priority_thresholds.orange` | `5` | Minimum score for 🟠 |
 | `priority_thresholds.yellow` | `2` | Minimum score for 🟡 |
@@ -261,21 +263,31 @@ log stream (usernoted) ──triggers──▶ NotificationCenter.app AX tree
                                     _parse_sender()
                                     "Name: message" → sender + body
                                               │
-                                    ThreadOrganizer
-                                    ├── Rule scoring (DM/mention/keyword)
-                                    ├── LLM clustering  (assigns thread_id,
-                                    │   aware of existing threads)
-                                    └── LLM urgency scoring (0–10 per thread)
+                                    ThreadOrganizer.process()
+                                    channel-slug grouping (no LLM)
+                                    → stored in SQLite instantly
                                               │
-                                    SQLite (data/notifications.db)
-                                              │
-                                    rumps menu bar (refreshes every 5s)
+                                    ┌─────────┴──────────┐
+                             manual │                    │ scheduled
+                             button │                    │ interval / on-notification
+                                    ▼                    ▼
+                            cluster_all()          score_all()
+                            LLM re-clusters        LLM scores each
+                            all messages into      thread 0–10,
+                            descriptive threads    updates priority
+                                    │
+                              rumps menu bar (refreshes every 5s)
 ```
 
-**Two LLM calls per batch:**
+**LLM operations are on-demand (not automatic by default):**
 
-1. **Thread clustering** — groups messages into conversation threads, optionally merging with existing ones
-2. **Urgency scoring** — scores each thread 0–10 based on action items, mentions, outages, deadlines
+- **Cluster Threads** — re-groups all messages into descriptive conversation threads
+- **Score Priority** — assigns urgency 0–10 to each thread; colours update (🔴🟠🟡⚪)
+
+**Auto-schedule options** (⚙ Settings → Auto-cluster / Auto-score):
+- `Off` — manual only
+- `On notification` — runs after every new notification batch
+- `Every 15/30/60 min` — background APScheduler job
 
 ---
 

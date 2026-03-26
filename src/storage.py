@@ -199,3 +199,47 @@ def message_exists(notification_id: str) -> bool:
             (notification_id,),
         ).fetchone()
         return row is not None
+
+
+def get_all_messages() -> list[sqlite3.Row]:
+    """Return every message in the DB (for batch LLM clustering)."""
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT m.id, m.thread_id, m.sender, m.channel, m.body, m.timestamp,
+                   m.notification_id, t.workspace
+            FROM messages m
+            LEFT JOIN threads t ON m.thread_id = t.id
+            ORDER BY m.timestamp ASC
+            """
+        ).fetchall()
+
+
+def reassign_message_thread(msg_id: str, new_thread_id: str) -> None:
+    """Move a message to a different thread."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE messages SET thread_id = ? WHERE id = ?",
+            (new_thread_id, msg_id),
+        )
+
+
+def update_thread_priority(
+    thread_id: str,
+    priority: float,
+    llm_score: float,
+) -> None:
+    """Update priority and LLM score for an existing thread."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE threads SET priority = ?, llm_score = ? WHERE id = ?",
+            (priority, llm_score, thread_id),
+        )
+
+
+def delete_empty_threads() -> None:
+    """Remove threads that have no messages (orphaned after re-clustering)."""
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM threads WHERE id NOT IN (SELECT DISTINCT thread_id FROM messages)"
+        )

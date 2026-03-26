@@ -1,26 +1,27 @@
 """
 Thread organizer — groups incoming Slack notifications into conversation threads
-and scores each thread for urgency/priority.
+and optionally scores each thread for urgency/priority.
 
-Priority = rule_score + (llm_score × llm_weight)
+Ingestion (always fast, no LLM):
+  New notifications → channel-slug grouping → stored in DB immediately.
 
-Rule-based signals (configured in config.yaml):
-  - Direct message  → +dm_bonus
-  - @mention        → +mention_bonus
-  - Urgency keyword → +keyword_bonus each
+On-demand / scheduled LLM operations:
+  cluster_all() — re-clusters ALL messages in DB using LLM, reassigns thread_ids.
+  score_all()   — scores ALL threads in DB using LLM, updates priorities.
 
-LLM signals:
-  1. Cluster new messages into threads.
-  2. Score each thread urgency 0–10.
+Interval config (config.yaml):
+   0  = manual only (button press)
+  -1  = run after every new notification batch
+   N  = run every N minutes (via APScheduler)
 """
 import json
 import logging
 import re
 import textwrap
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from src.config import cfg
 from src.llm.base import BackendFactory
@@ -30,11 +31,7 @@ from src import storage
 logger = logging.getLogger(__name__)
 
 _SCORING = cfg.get("scoring", {})
-_DM_BONUS = _SCORING.get("dm_bonus", 3)
-_MENTION_BONUS = _SCORING.get("mention_bonus", 2)
-_KEYWORD_BONUS = _SCORING.get("keyword_bonus", 2)
 _LLM_WEIGHT = _SCORING.get("llm_weight", 1.0)
-_KEYWORDS = [kw.lower() for kw in cfg.get("urgency_keywords", [])]
 
 
 @dataclass
@@ -45,29 +42,10 @@ class MessageBundle:
     workspace: str
     body: str
     timestamp: str
-    rule_score: float = 0.0
     thread_id: Optional[str] = None
 
 
-def _compute_rule_score(notif: SlackNotification) -> float:
-    score = 0.0
-    channel_lower = notif.channel.lower()
-    body_lower = notif.body.lower()
-
-    if channel_lower.startswith("dm") or "direct message" in channel_lower:
-        score += _DM_BONUS
-
-    if "@" in notif.body or "mentioned you" in body_lower:
-        score += _MENTION_BONUS
-
-    for kw in _KEYWORDS:
-        if kw in body_lower:
-            score += _KEYWORD_BONUS
-
-    return score
-
-
-def _extract_json(text: str) -> any:
+def _extract_json(text: str):
     """Try to pull a JSON object/array out of LLM output that may have prose around it."""
     match = re.search(r"(\[.*\]|\{.*\})", text, re.DOTALL)
     if match:
@@ -78,11 +56,25 @@ def _extract_json(text: str) -> any:
     return None
 
 
+@staticmethod
+def _channel_thread_id(channel: str, workspace: str = "") -> str:
+    """Deterministic slug based on workspace+channel only (no sender)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", f"{workspace}-{channel}".lower()).strip("-")
+    return slug[:40] or "general"
+
+
 class ThreadOrganizer:
     def __init__(self) -> None:
         # LLM backend — lazily instantiated when first needed.
         self._llm = None
         self._llm_backend_name: Optional[str] = None
+        # Optional hook called after process() stores new notifications.
+        # Used to trigger on-notification cluster/score runs.
+        self._post_process_hooks: list[Callable] = []
+
+    def add_post_process_hook(self, fn: Callable) -> None:
+        """Register a callable to invoke after each batch of new notifications is stored."""
+        self._post_process_hooks.append(fn)
 
     def _get_llm(self):
         """Return the LLM backend, re-instantiating if the configured backend changed."""
@@ -92,19 +84,23 @@ class ThreadOrganizer:
             self._llm_backend_name = backend_name
         return self._llm
 
+    # ------------------------------------------------------------------ #
+    #  Ingestion (no LLM)                                                  #
+    # ------------------------------------------------------------------ #
+
     def process(self, notifications: list[SlackNotification]) -> None:
-        """Process a batch of new notifications end-to-end."""
+        """
+        Ingest a batch of new notifications using channel-slug grouping.
+        No LLM calls are made here. Post-process hooks (e.g. auto cluster/score)
+        are invoked after storage if any new notifications were saved.
+        """
         if not notifications:
             return
 
-        # Filter already-seen notifications.
         new = [n for n in notifications if not storage.message_exists(n.notification_id)]
         if not new:
             return
 
-        no_ai: bool = cfg.get("no_ai", False)
-
-        # Step 1 — rule-based scoring.
         bundles = [
             MessageBundle(
                 notification_id=n.notification_id,
@@ -113,139 +109,139 @@ class ThreadOrganizer:
                 workspace=n.workspace,
                 body=n.body,
                 timestamp=n.timestamp,
-                rule_score=_compute_rule_score(n),
+                thread_id=_channel_thread_id(n.channel, n.workspace),
             )
             for n in new
         ]
 
-        if no_ai:
-            # No-AI: group by channel slug, skip all LLM calls.
-            bundles = self._cluster_by_channel(bundles)
-            thread_scores: dict[str, float] = {}
-        else:
-            # Step 2 — LLM thread clustering.
-            bundles = self._cluster_threads(bundles)
-            # Step 3 — LLM urgency scoring per thread.
-            thread_scores = self._score_threads(bundles)
+        self._persist(bundles)
 
-        # Step 4 — Persist.
-        self._persist(bundles, thread_scores, no_ai=no_ai)
+        for hook in self._post_process_hooks:
+            try:
+                hook()
+            except Exception:
+                logger.exception("Post-process hook failed")
 
     # ------------------------------------------------------------------ #
-    #  LLM helpers                                                         #
+    #  On-demand / scheduled LLM operations                               #
     # ------------------------------------------------------------------ #
 
-    def _cluster_by_channel(self, bundles: list[MessageBundle]) -> list[MessageBundle]:
+    def cluster_all(self) -> None:
         """
-        No-AI grouping: every message in the same workspace+channel goes into
-        one thread. Uses a deterministic slug — no LLM call made.
+        Re-cluster ALL messages in the DB using the LLM.
+        Moves messages between threads, creates new threads as needed.
         """
-        for b in bundles:
-            b.thread_id = self._channel_thread_id(b.channel, b.workspace)
-        return bundles
+        all_msgs = storage.get_all_messages()
+        if not all_msgs:
+            logger.info("cluster_all: no messages to cluster")
+            return
 
-    @staticmethod
-    def _channel_thread_id(channel: str, workspace: str = "") -> str:
-        """Deterministic slug based on workspace+channel only (no sender)."""
-        slug = re.sub(r"[^a-z0-9]+", "-", f"{workspace}-{channel}".lower()).strip("-")
-        return slug[:40] or "general"
+        logger.info("cluster_all: clustering %d messages", len(all_msgs))
 
-    def _cluster_threads(self, bundles: list[MessageBundle]) -> list[MessageBundle]:
-        """
-        Ask the LLM to group incoming messages into threads.
-
-        Also passes existing thread context so new messages can be merged
-        into threads already in the DB rather than always creating new ones.
-        """
-        # Load recent existing threads as context (cap at 30 to stay within token budget).
-        existing_threads = storage.get_threads_by_priority(limit=30)
+        existing_threads = storage.get_threads_by_priority(limit=50)
         existing_context = "\n".join(
             f"  EXISTING id={t['id']!r} channel={t['channel']!r} "
             f"workspace={t['workspace']!r} last_msg={t['last_body'][:80]!r}"
             for t in existing_threads
         )
 
-        def _flags(b: MessageBundle) -> str:
-            flags = []
-            if b.channel.lower().startswith(("dm", "direct")):
-                flags.append("DM")
-            if "@" in b.body:
-                flags.append("@mention")
-            if b.sender.lower().endswith(("bot", "(bot)")):
-                flags.append("bot")
-            if not b.sender:
-                flags.append("automated")
-            return ",".join(flags) or "normal"
-
         messages_text = "\n".join(
-            f"{i}: channel={b.channel!r} workspace={b.workspace!r} "
-            f"sender={b.sender!r} flags={_flags(b)} "
-            f"body={b.body[:120]!r}"
-            for i, b in enumerate(bundles)
+            f"{i}: id={m['id']!r} channel={m['channel']!r} "
+            f"workspace={m['workspace'] or ''!r} sender={m['sender']!r} "
+            f"body={m['body'][:120]!r}"
+            for i, m in enumerate(all_msgs)
         )
 
         existing_section = (
-            f"\nExisting threads already in the system (you may reuse their id):\n{existing_context}\n"
+            f"\nExisting threads (you may reuse their id):\n{existing_context}\n"
             if existing_context else ""
         )
 
         prompt = textwrap.dedent(f"""
-            You are a Slack thread organiser. Your job is to assign each new message
-            to a conversation thread — either an EXISTING thread or a NEW one.
+            You are a Slack thread organiser. Re-cluster ALL messages below into
+            conversation threads.
 
             RULES:
-            1. If a new message clearly continues an existing thread (same channel,
-               same topic, or a direct reply), assign it the EXISTING thread id.
-            2. If multiple new messages belong together, give them the SAME new thread_id.
-            3. Messages in DIFFERENT channels are NEVER in the same thread.
-            4. Automated/bot messages (flags: automated, bot) should each get their
-               own thread unless they are clearly the same alert repeating.
-            5. Calendar reminders are always standalone threads.
-            6. thread_id must be a lowercase hyphenated slug, max 40 chars.
-               Make new slugs descriptive, e.g. "preprod-deploy-failure".
-            7. Respond ONLY with a JSON array — no explanation.
+            1. Reuse an EXISTING thread id if the message clearly belongs there.
+            2. Messages in DIFFERENT channels are NEVER in the same thread.
+            3. Bot/automated messages get their own thread unless they repeat the same alert.
+            4. Calendar reminders are always standalone threads.
+            5. thread_id must be a lowercase hyphenated slug, max 40 chars.
+               Make slugs descriptive, e.g. "preprod-deploy-failure".
+            6. Respond ONLY with a JSON array — no explanation.
 
             Output format:
             [
-              {{"index": 0, "thread_id": "existing-or-new-slug"}},
-              {{"index": 1, "thread_id": "existing-or-new-slug"}},
+              {{"index": 0, "thread_id": "slug"}},
+              {{"index": 1, "thread_id": "slug"}},
               ...
             ]
             {existing_section}
-            New messages to classify:
+            Messages:
             {messages_text}
         """).strip()
 
         try:
             raw = self._get_llm().ask(prompt)
             parsed = _extract_json(raw)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    idx = item.get("index")
-                    tid = item.get("thread_id")
-                    if idx is not None and tid and 0 <= idx < len(bundles):
-                        bundles[idx].thread_id = str(tid)[:40]
+            if not isinstance(parsed, list):
+                logger.warning("cluster_all: LLM returned non-list, aborting")
+                return
         except Exception as exc:
-            logger.warning("Thread clustering LLM call failed: %s", exc)
+            logger.warning("cluster_all LLM call failed: %s", exc)
+            return
 
-        # Fallback: any unassigned bundle gets a deterministic slug.
-        for b in bundles:
-            if not b.thread_id:
-                b.thread_id = self._stable_thread_id(b.channel, b.sender, b.workspace)
+        # Apply reassignments.
+        for item in parsed:
+            idx = item.get("index")
+            tid = item.get("thread_id")
+            if idx is None or not tid or not (0 <= idx < len(all_msgs)):
+                continue
+            tid = str(tid)[:40]
+            msg = all_msgs[idx]
+            old_tid = msg["thread_id"]
+            if tid == old_tid:
+                continue
+            # Ensure the target thread exists (create stub if new slug).
+            if not any(t["id"] == tid for t in existing_threads):
+                storage.upsert_thread(
+                    thread_id=tid,
+                    channel=msg["channel"],
+                    workspace=msg["workspace"] or "",
+                    sender=msg["sender"] or "",
+                    last_body=msg["body"][:200],
+                    nc_group_desc="",
+                    priority=0.0,
+                    rule_score=0.0,
+                    llm_score=0.0,
+                )
+            storage.reassign_message_thread(msg["id"], tid)
 
-        return bundles
+        # Clean up orphaned threads (no messages left).
+        storage.delete_empty_threads()
+        logger.info("cluster_all: complete")
 
-    def _score_threads(self, bundles: list[MessageBundle]) -> dict[str, float]:
-        """Ask the LLM to score each unique thread 0–10 for urgency."""
-        thread_map: dict[str, list[MessageBundle]] = {}
-        for b in bundles:
-            thread_map.setdefault(b.thread_id, []).append(b)
+    def score_all(self) -> None:
+        """
+        Score ALL threads in the DB using the LLM.
+        Updates priority and llm_score for each thread.
+        """
+        threads = storage.get_threads_by_priority()
+        if not threads:
+            logger.info("score_all: no threads to score")
+            return
+
+        logger.info("score_all: scoring %d threads", len(threads))
 
         threads_text = ""
-        for tid, msgs in thread_map.items():
-            threads_text += f"\nThread '{tid}':\n"
-            for m in msgs:
-                threads_text += f"  - [{m.workspace}#{m.channel}] {m.sender}: {m.body}\n"
+        for t in threads:
+            threads_text += f"\nThread '{t['id']}':\n"
+            msgs = storage.get_messages_for_thread(t["id"])
+            for m in msgs[:10]:  # cap per thread to stay within token budget
+                threads_text += (
+                    f"  - [{t['workspace']}#{t['channel']}] "
+                    f"{m['sender']}: {m['body'][:120]}\n"
+                )
 
         prompt = textwrap.dedent(f"""
             You are a workplace assistant helping prioritise Slack messages.
@@ -264,62 +260,51 @@ class ThreadOrganizer:
             {threads_text}
         """).strip()
 
-        scores: dict[str, float] = {}
         try:
             raw = self._get_llm().ask(prompt)
             parsed = _extract_json(raw)
-            if isinstance(parsed, dict):
-                for tid, score in parsed.items():
-                    try:
-                        scores[tid] = max(0.0, min(10.0, float(score)))
-                    except (TypeError, ValueError):
-                        pass
+            if not isinstance(parsed, dict):
+                logger.warning("score_all: LLM returned non-dict, aborting")
+                return
         except Exception as exc:
-            logger.warning("Urgency scoring LLM call failed: %s", exc)
+            logger.warning("score_all LLM call failed: %s", exc)
+            return
 
-        return scores
+        for tid, score in parsed.items():
+            try:
+                llm_score = max(0.0, min(10.0, float(score)))
+                priority = llm_score * _LLM_WEIGHT
+                storage.update_thread_priority(tid, priority, llm_score)
+            except (TypeError, ValueError):
+                pass
+
+        logger.info("score_all: complete")
 
     # ------------------------------------------------------------------ #
     #  Persistence                                                         #
     # ------------------------------------------------------------------ #
 
-    def _persist(
-        self,
-        bundles: list[MessageBundle],
-        thread_scores: dict[str, float],
-        no_ai: bool = False,
-    ) -> None:
-        # Compute per-thread aggregates.
+    def _persist(self, bundles: list[MessageBundle]) -> None:
         thread_bundles: dict[str, list[MessageBundle]] = {}
         for b in bundles:
             thread_bundles.setdefault(b.thread_id, []).append(b)
 
         for tid, msgs in thread_bundles.items():
-            if no_ai:
-                priority = 0.0
-                llm_score = 0.0
-                max_rule = 0.0
-            else:
-                llm_score = thread_scores.get(tid, 0.0)
-                max_rule = max(m.rule_score for m in msgs)
-                priority = max_rule + (llm_score * _LLM_WEIGHT)
             latest = max(msgs, key=lambda m: m.timestamp)
-
             storage.upsert_thread(
                 thread_id=tid,
                 channel=latest.channel,
                 workspace=latest.workspace,
                 sender=latest.sender,
                 last_body=latest.body[:200],
-                nc_group_desc=getattr(latest, "nc_group_desc", ""),
-                priority=priority,
-                rule_score=max_rule,
-                llm_score=llm_score,
+                nc_group_desc="",
+                priority=0.0,
+                rule_score=0.0,
+                llm_score=0.0,
             )
-
             for m in msgs:
                 storage.upsert_message(
-                    msg_id=f"{m.notification_id}",
+                    msg_id=m.notification_id,
                     thread_id=tid,
                     sender=m.sender,
                     channel=m.channel,
@@ -328,7 +313,3 @@ class ThreadOrganizer:
                     notification_id=m.notification_id,
                 )
 
-    @staticmethod
-    def _stable_thread_id(channel: str, sender: str, workspace: str = "") -> str:
-        slug = re.sub(r"[^a-z0-9]+", "-", f"{workspace}-{channel}-{sender}".lower()).strip("-")
-        return slug[:40] or str(uuid.uuid4())[:8]

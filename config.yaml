@@ -4,36 +4,13 @@
 # Options: copilot, claude, openai
 llm:
   backend: copilot
+  # Multiplier applied to LLM urgency score (0–10) when setting priority.
+  score_weight: 1.0
 
 # How often (in seconds) to poll the macOS Notification Center DB.
 poll_interval: 5
 
-# Keywords that boost a message's urgency score (+2 each, case-insensitive).
-urgency_keywords:
-  - urgent
-  - asap
-  - "as soon as possible"
-  - deadline
-  - critical
-  - outage
-  - down
-  - broken
-  - blocked
-  - emergency
-  - help
-  - "action required"
-  - "follow up"
-  - p0
-  - p1
-
-# Scoring weights (rule-based signals)
-scoring:
-  dm_bonus: 3          # Direct message
-  mention_bonus: 2     # @mention in channel
-  keyword_bonus: 2     # Each matched urgency keyword
-  llm_weight: 1.0      # Multiplier applied to LLM urgency score (0–10)
-
-# Priority thresholds for colour indicators
+# Priority thresholds for colour indicators (set by score_all / Score Priority button)
 priority_thresholds:
   red: 8
   orange: 5
@@ -50,6 +27,9 @@ badge_threshold: 1
 # Uses `caffeinate -i` (idle sleep only — battery-friendly, display still sleeps).
 prevent_sleep: true
 
-# Disable LLM calls entirely. Threads are grouped by workspace+channel only.
-# All threads get equal priority (no colour coding).
-no_ai: false
+# When to automatically run LLM clustering and priority scoring.
+# 0  = manual only (use the menu bar buttons)
+# -1 = after every new notification batch
+# N  = every N minutes (e.g. 30)
+cluster_interval: 0
+score_interval: 0
