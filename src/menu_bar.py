@@ -3,7 +3,7 @@ macOS menu bar app — built with rumps.
 
 Thread list with accordion-style submenus:
 
-  🔔 3
+  💬 3
   ─────────────────────────────────────
   ● 🔴  [#oncall]  Alice: server down   ▶
        ├─ 🔗 Open in Slack (exact message)
@@ -21,6 +21,7 @@ import logging
 import subprocess
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 import rumps
@@ -41,6 +42,9 @@ _T_ORANGE      = _THRESHOLDS.get("orange", 5)
 _T_YELLOW      = _THRESHOLDS.get("yellow", 2)
 _MAX_THREADS   = cfg.get("max_threads_displayed", 20)
 _BADGE_THRESHOLD = cfg.get("badge_threshold", 1)
+
+# Menu bar icon — Slack-themed hashtag PNG (22×22 pt, @2x for retina).
+_ICON_PATH = str(Path(__file__).resolve().parent.parent / "assets" / "slackd_icon.png")
 
 # Interval options shown in the Settings submenus.
 _INTERVAL_OPTIONS = [
@@ -154,7 +158,9 @@ def _navigate_to_message(nc_group_desc: str, channel: str, workspace: str,
 
 class SlackOrganizerApp(rumps.App):
     def __init__(self, organizer=None, scheduler=None) -> None:
-        super().__init__(name="SlackOrganizer", title="🔔", quit_button=None)
+        super().__init__(name="SlackOrganizer", title=None, quit_button=None)
+        self.icon = _ICON_PATH
+        self.template = True  # renders as template image (auto light/dark)
         self._organizer = organizer
         self._scheduler = scheduler
         self._llm_running = False  # guards concurrent LLM button presses
@@ -170,7 +176,7 @@ class SlackOrganizerApp(rumps.App):
         threads = storage.get_threads_by_priority(limit=_MAX_THREADS)
         unread  = storage.get_unread_count()
 
-        self.title = f"🔔 {unread}" if unread >= _BADGE_THRESHOLD else "🔔"
+        self.title = f" {unread}" if unread >= _BADGE_THRESHOLD else None
 
         if not threads:
             self.menu.add(rumps.MenuItem("No Slack notifications yet", callback=None))
@@ -399,7 +405,7 @@ class SlackOrganizerApp(rumps.App):
         if self._organizer is None or self._llm_running:
             return
         self._llm_running = True
-        self.title = "🔔 (clustering...)"
+        self.title = " …"
 
         def _task():
             try:
@@ -414,7 +420,7 @@ class SlackOrganizerApp(rumps.App):
         if self._organizer is None or self._llm_running:
             return
         self._llm_running = True
-        self.title = "🔔 (scoring...)"
+        self.title = " …"
 
         def _task():
             try:
