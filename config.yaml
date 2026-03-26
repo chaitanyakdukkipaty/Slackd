@@ -1,0 +1,47 @@
+# Slack Notification Organizer — Configuration
+
+# LLM backend to use for thread clustering and urgency scoring.
+# Options: copilot, claude, openai
+llm:
+  backend: copilot
+
+# How often (in seconds) to poll the macOS Notification Center DB.
+poll_interval: 5
+
+# Keywords that boost a message's urgency score (+2 each, case-insensitive).
+urgency_keywords:
+  - urgent
+  - asap
+  - "as soon as possible"
+  - deadline
+  - critical
+  - outage
+  - down
+  - broken
+  - blocked
+  - emergency
+  - help
+  - "action required"
+  - "follow up"
+  - p0
+  - p1
+
+# Scoring weights (rule-based signals)
+scoring:
+  dm_bonus: 3          # Direct message
+  mention_bonus: 2     # @mention in channel
+  keyword_bonus: 2     # Each matched urgency keyword
+  llm_weight: 1.0      # Multiplier applied to LLM urgency score (0–10)
+
+# Priority thresholds for colour indicators
+priority_thresholds:
+  red: 8
+  orange: 5
+  yellow: 2
+  # below 2 = grey / white circle
+
+# Maximum number of threads shown in menu bar (0 = unlimited)
+max_threads_displayed: 20
+
+# Number of unread threads to accumulate before showing badge on icon
+badge_threshold: 1
