@@ -20,7 +20,7 @@ Thread list with accordion-style submenus:
 import logging
 import subprocess
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -84,56 +84,25 @@ def _bare_channel_name(channel: str) -> str:
     return name
 
 
-def _slack_date_range(timestamp: str):
-    """
-    Parse an ISO-8601 timestamp and return (after_date, before_date) strings
-    for a ±10-minute Slack search window (YYYY-MM-DD format).
-    Returns (None, None) if timestamp is unparseable.
-    """
-    try:
-        ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    except Exception:
-        return None, None
-    start = ts - timedelta(minutes=10)
-    end   = ts + timedelta(minutes=10)
-    # Return date strings; if the window crosses midnight include both dates
-    after  = start.strftime("%Y-%m-%d")
-    before = end.strftime("%Y-%m-%d")
-    return after, before
-
-
 def _open_in_slack_fallback(channel: str, workspace: str, body: str = "",
                              timestamp: str = "") -> None:
     """
     Fallback: open Slack, jump to channel via Quick Switcher (⌘K),
-    then search with ⌘F. When a timestamp is provided, a ±10-minute date
-    range (after:/before:) is prepended to the query for tighter filtering.
+    then paste the search text into ⌘F.
+
+    Uses clipboard-paste (⌘V) instead of keystroke so that Unicode and emoji
+    in the message body are typed correctly.  The user's previous clipboard
+    contents are saved and restored after the search is submitted.
     """
     bare = _bare_channel_name(channel).replace("'", "\\'")
     if not bare:
         subprocess.run(["open", "-a", "Slack"], check=False)
         return
 
-    # Trim body for search — first ~50 chars, no quotes/backslashes
-    search_text = ""
-    if body:
-        search_text = body[:50].replace("'", "").replace('"', "").replace("\\", "").strip()
+    # Trim body — first 60 chars; escape backslashes and double-quotes for AppleScript string
+    search_text = (body or "")[:60].replace("\\", "\\\\").replace('"', '\\"').strip()
 
-    # Build the search query, optionally with a ±10-min date range.
-    if timestamp:
-        after, before = _slack_date_range(timestamp)
-        if after and before and after != before:
-            date_filter = f"after:{after} before:{before} "
-        elif after:
-            date_filter = f"after:{after} "
-        else:
-            date_filter = ""
-    else:
-        date_filter = ""
-
-    full_query = f"{date_filter}{search_text}".strip()
-
-    if full_query:
+    if search_text:
         script = f"""
             tell application "Slack" to activate
             delay 0.6
@@ -145,15 +114,22 @@ def _open_in_slack_fallback(channel: str, workspace: str, body: str = "",
                     delay 0.5
                     key code 36
                     delay 1.0
-                    key code 53
-                    delay 0.3
                     keystroke "f" using command down
                     delay 0.5
-                    keystroke "{full_query}"
-                    delay 0.5
+                end tell
+            end tell
+            -- Save current clipboard, paste search text, restore after Enter
+            set _prev to (the clipboard as text) & ""
+            set the clipboard to "{search_text}"
+            tell application "System Events"
+                tell process "Slack"
+                    keystroke "v" using command down
+                    delay 0.4
                     key code 36
                 end tell
             end tell
+            delay 0.2
+            set the clipboard to _prev
         """
     else:
         script = f"""
@@ -320,11 +296,13 @@ class SlackOrganizerApp(rumps.App):
         if messages:
             item.add(rumps.separator)
             for msg in messages:
-                time_str = _fmt_time(msg["timestamp"])
-                msender  = (msg["sender"] or "")[:18]
-                mbody    = (msg["body"]   or "")[:60]
+                time_str   = _fmt_time(msg["timestamp"])
+                msender    = (msg["sender"] or "")[:18]
+                mbody      = (msg["body"]   or "")[:60]
                 sender_label = f"{msender}: " if msender else ""
-                msg_label = f"  {time_str}  {sender_label}{mbody}"
+                is_read    = msg["is_read"] if "is_read" in msg.keys() else 0
+                read_dot   = "○" if is_read else "●"
+                msg_label  = f"{read_dot} {time_str}  {sender_label}{mbody}"
                 # Each message stores its own nc_group_desc — use it for exact NC click.
                 msg_nc_desc = (msg["nc_group_desc"] or "") if "nc_group_desc" in msg.keys() else ""
                 item.add(rumps.MenuItem(
