@@ -160,7 +160,7 @@ class SlackOrganizerApp(rumps.App):
     def __init__(self, organizer=None, scheduler=None) -> None:
         super().__init__(name="SlackOrganizer", title=None, quit_button=None)
         self.icon = _ICON_PATH
-        self.template = True  # renders as template image (auto light/dark)
+        self.template = False  # keep original colours (not a monochrome template)
         self._organizer = organizer
         self._scheduler = scheduler
         self._llm_running = False  # guards concurrent LLM button presses
